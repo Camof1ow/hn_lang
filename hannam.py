@@ -1,256 +1,553 @@
 """
-한남랭 (HannamLang) 인터프리터
+한남랭 (HannamLang) 인터프리터 v3.0
 한글 감탄사/의성어로 구성된 난해한 프로그래밍 언어
 엄랭(umjunsik-lang)에서 영감을 받아 제작
+
+사용법:
+    python hannam.py <파일.한남>
+    python hannam.py --debug <파일.한남>
+    python hannam.py --ast <파일.한남>
+    python hannam.py --repl
 """
 
 import sys
+import re
+
+# ══════════════════════════════════════════════════════════════
+# 키워드 상수
+# ══════════════════════════════════════════════════════════════
+
+K_K = '\u314B'                    # ㅋ (변수 접두사)
+K_ASSIGN = '\uC5C4'               # 엄 (대입)
+K_PRINT = '\uC934\uC934\uC774\uC57C'  # 줴줴이야 (출력)
+K_INPUT = '\uC81C\uAC00\uC694?'   # 제가요? (입력)
+K_NEWLINE_KW = '\uD2F0'           # 티 (개행 시작)
+K_NEWLINE_END = '\uC6D0'          # 원 (개행 끝)
+K_LOOP_START = f'{K_K}{K_K}..{K_K}{K_K}'  # ㅋㅋ..ㅋㅋ (루프 시작)
+K_LOOP_BREAK = '\uC544\uB1E8\uC544\uB1E8\uC544\uB1E8'  # 아뇨아뇨아뇨
+K_COND = '\uC544\uB1E8'           # 아뇨 (조건문)
+K_JUMP = '\uC694\uC774'           # 요이 (줄 점프)
+K_EXIT = '\uB0B4\uC544\uB0B4\uC784'  # 내아내임 (종료)
+K_START = '\uC608? \uC800\uC694?' # 예? 저요? (시작)
+K_FUNC_DEF = '\uC934\uB77C'       # 쥐랄 (함수 선언)
+K_FUNC_END = '\uC934\uB77C\uCE5C\uCE5C'  # 쥐랄ㅋㅋ (함수 끝)
+K_CALL = '\uC5B4\uC774'           # 어이 (함수 호출)
+K_EQ = '\uC934~\uB77C'            # 쥐~랄 (==)
+K_GT = '\uC934~~\uB77C'           # 쥐~~랄 (>)
+K_LT = '\uC934~~~\uB77C'          # 쥐~~~랄 (<)
+K_NE = '\uC934\uD788\uB77C'      # 쥐히랄 (!=)
 
 
-class HannamLang:
-    def __init__(self):
-        self.memory = {}       # 변수 메모리 (1-indexed)
-        self.loops = []        # 루프 시작 위치 스택
-        self.pointer = 0       # 명령어 포인터
-        self.lines = []        # 명령어 라인들
-        self.running = False
+# ══════════════════════════════════════════════════════════════
+# 수식 파서 (연산자 우선순위: 비교 < 덧셈 < 곱셈 < 단항)
+# ══════════════════════════════════════════════════════════════
 
-    def get_var(self, index):
-        """변수값 반환 (미설정시 0)"""
-        return self.memory.get(index, 0)
+class ExprParser:
+    """수식 파서: 사칙연산, 괄호, 변수 참조, 비교 연산 지원"""
 
-    def set_var(self, index, value):
-        """변수값 설정"""
-        self.memory[index] = value
+    def __init__(self, get_var_fn):
+        self.get_var = get_var_fn
+        self.s = ''
+        self.pos = 0
 
-    def parse_number(self, expr):
-        """
-        수식 파싱:
-        - `.` = +1, `,` = -1
-        - `~` = 물결 카운트 (갯수 = 값)
-        - 공백 = 곱셈 연산자
-        - `아`×N = N번째 변수값
-        - `예?` = stdin 입력
-
-        예시:
-        - `티~~~~원` = 4 (물결 4개)
-        - `..` = 2
-        - `아..` = var[1] + 2
-        - `.. ..` = 4 (2×2)
-        """
+    def parse(self, expr):
         expr = expr.strip()
         if not expr:
             return 0
+        # 공백 = 곱셈 연산자 (전처리)
+        # 점/쉼표/ㅋ/닫는괄호 뒤 + 숫자/ㅋ/여는괄호 앞 → 곱셈
+        expr = re.sub(r'(?<=[.,\)\u314B])\s+(?=[.,\(\u314B\d])', '*', expr)
+        expr = re.sub(r'\s+', '', expr)
+        self.s = expr
+        self.pos = 0
+        result = self._expr()
+        return result
 
-        # 곱셈 분리 (공백 기준)
-        if ' ' in expr:
-            parts = expr.split(' ')
-            result = 1
-            for part in parts:
-                result *= self.parse_number(part)
-            return result
+    def _peek(self):
+        return self.s[self.pos] if self.pos < len(self.s) else None
 
-        value = 0
+    def _advance(self):
+        self.pos += 1
 
-        # 변수 참조 (ㅋ 반복)
-        kk_count = 0
-        temp = expr
-        while temp.startswith('ㅋ'):
-            kk_count += 1
-            temp = temp[1:]
-        if kk_count > 0:
-            value += self.get_var(kk_count)
-            expr = temp
+    def _expr(self):
+        return self._comparison()
 
-        # 입력 (예?)
-        if '예?' in expr:
+    def _comparison(self):
+        left = self._additive()
+        while self._peek() == '\uC934':  # 쥐
+            saved = self.pos
+            if self.s[self.pos:].startswith(K_NE):
+                self.pos += len(K_NE)
+                right = self._additive()
+                left = 1 if left != right else 0
+            elif self.s[self.pos:].startswith(K_LT):
+                self.pos += len(K_LT)
+                right = self._additive()
+                left = 1 if left < right else 0
+            elif self.s[self.pos:].startswith(K_GT):
+                self.pos += len(K_GT)
+                right = self._additive()
+                left = 1 if left > right else 0
+            elif self.s[self.pos:].startswith(K_EQ):
+                self.pos += len(K_EQ)
+                right = self._additive()
+                left = 1 if left == right else 0
+            else:
+                break
+        return left
+
+    def _additive(self):
+        left = self._multiplicative()
+        while self._peek() in ('+', '-'):
+            op = self._peek()
+            self._advance()
+            right = self._multiplicative()
+            left = left + right if op == '+' else left - right
+        return left
+
+    def _multiplicative(self):
+        left = self._unary()
+        while self._peek() in ('*', '/', '%'):
+            op = self._peek()
+            self._advance()
+            right = self._unary()
+            if op == '*':
+                left *= right
+            elif op == '/':
+                left = int(left / right) if right != 0 else 0
+            else:
+                left = left % right if right != 0 else 0
+        return left
+
+    def _unary(self):
+        if self._peek() == '-':
+            self._advance()
+            return -self._atom()
+        if self._peek() == '+':
+            self._advance()
+            return self._atom()
+        return self._atom()
+
+    def _atom(self):
+        c = self._peek()
+        if c is None:
+            return 0
+
+        # 숫자 리터럴
+        if c.isdigit():
+            start = self.pos
+            while self.pos < len(self.s) and self.s[self.pos].isdigit():
+                self.pos += 1
+            return int(self.s[start:self.pos])
+
+        # 괄호
+        if c == '(':
+            self._advance()
+            val = self._expr()
+            if self._peek() == ')':
+                self._advance()
+            return val
+
+        # stdin 입력
+        if c == '\uC608' and self.pos + 1 < len(self.s) and self.s[self.pos + 1] == '?':
+            self._advance()
+            self._advance()
             try:
-                user_input = int(input())
+                return int(input("입력: "))
             except (ValueError, EOFError):
-                user_input = 0
-            expr = expr.replace('예?', '.' * user_input)
+                return 0
 
-        # 물결 카운트 (티~~~~원 → 4)
-        tilde_count = expr.count('~')
-        if tilde_count > 0:
-            value += tilde_count
-            expr = expr.replace('~', '')
+        # 변수 참조 (ㅋ×N)
+        if c == K_K:
+            count = 0
+            while self.pos < len(self.s) and self.s[self.pos] == K_K:
+                count += 1
+                self.pos += 1
+            val = self.get_var(count)
+            # 뒤따르는 ./,/~ 도 같은 원자에 포함
+            while self.pos < len(self.s) and self.s[self.pos] in ('.', ',', '~'):
+                ch = self.s[self.pos]
+                if ch == '.':
+                    val += 1
+                elif ch == ',':
+                    val -= 1
+                elif ch == '~':
+                    val += 1
+                self.pos += 1
+            return val
 
-        # 점/쉼표 카운트
-        value += expr.count('.')
-        value -= expr.count(',')
+        # 숫자 표현 (. = +1, , = −1, ~ = 카운트)
+        if c in ('.', ',', '~'):
+            val = 0
+            while self.pos < len(self.s) and self.s[self.pos] in ('.', ',', '~'):
+                ch = self.s[self.pos]
+                if ch == '.':
+                    val += 1
+                elif ch == ',':
+                    val -= 1
+                elif ch == '~':
+                    val += 1
+                self.pos += 1
+            return val
 
-        return value
+        raise SyntaxError(f"알 수 없는 토큰: '{c}' (위치 {self.pos})")
 
-    def parse_line(self, line):
-        """
-        한 줄 실행.
-        반환값:
-        - None: 정상 (다음 줄로)
-        - int: 점프할 줄 번호 (0-indexed)
-        - str: 조건부 실행할 명령어
-        """
+
+# ══════════════════════════════════════════════════════════════
+# 명령어 (AST 노드)
+# ══════════════════════════════════════════════════════════════
+
+class Inst:
+    __slots__ = ('kind', 'data')
+
+    def __init__(self, kind, **data):
+        self.kind = kind
+        self.data = data
+
+    def __repr__(self):
+        d = {k: v for k, v in self.data.items() if k != 'line'}
+        return f"Inst({self.kind}, {d})"
+
+
+# ══════════════════════════════════════════════════════════════
+# 인터프리터
+# ══════════════════════════════════════════════════════════════
+
+class HannamLang:
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.memory = {}
+        self.functions = {}
+        self.instructions = []
+        self.loop_stack = []
+        self.pc = 0
+        self.parser = ExprParser(lambda idx: self.memory.get(idx, 0))
+
+    def _val(self, expr, ctx=""):
+        return self.parser.parse(expr)
+
+    # ── 파싱 ──
+
+    def parse(self, source):
+        lines = source.split('\n')
+        self.instructions = []
+        self.functions = {}
+        i = 0
+        while i < len(lines):
+            line = self._clean(lines[i])
+            lineno = i + 1
+
+            if not line:
+                self.instructions.append(Inst('nop', line=lineno))
+                i += 1
+                continue
+
+            # 함수 선언
+            if line.startswith(K_FUNC_DEF) and len(line) > len(K_FUNC_DEF):
+                name = line[len(K_FUNC_DEF):].strip()
+                body_lines = []
+                i += 1
+                while i < len(lines):
+                    bl = self._clean(lines[i])
+                    if bl == K_FUNC_END:
+                        break
+                    body_lines.append(lines[i])
+                    i += 1
+                else:
+                    raise SyntaxError(f"함수 '{name}'에 '{K_FUNC_END}'가 없습니다 (줄 {lineno})")
+                self.functions[name] = self._parse_body(body_lines, lineno)
+                self.instructions.append(Inst('nop', line=lineno))
+                i += 1
+                continue
+
+            inst = self._parse_line(line, lineno)
+            self.instructions.append(inst)
+            i += 1
+
+        # 시작/종료 검증
+        real = [i for i in self.instructions if i.kind != 'nop']
+        if not real or real[0].kind != 'start':
+            raise SyntaxError("한남랭은 '예? 저요?'로 시작해야 합니다!")
+        if real[-1].kind != 'exit':
+            raise SyntaxError("한남랭은 '내아내임'으로 종료해야 합니다!")
+
+    def _clean(self, line):
         line = line.strip()
+        if '#' in line:
+            line = line[:line.index('#')].strip()
+        return line
 
-        # 빈 줄 / 주석
-        if not line or line.startswith('#'):
-            return None
+    def _parse_body(self, raw_lines, base_lineno):
+        """함수 본체를 Instruction 리스트로 파싱"""
+        insts = []
+        for i, raw in enumerate(raw_lines):
+            line = self._clean(raw)
+            if not line:
+                continue
+            insts.append(self._parse_line(line, base_lineno + i))
+        return insts
 
-        # 내아내임 (종료)
-        if line.startswith('내아내임'):
-            value_expr = line[len('내아내임'):]
-            ret = self.parse_number(value_expr)
-            print(f"\n[한남랭] 종료. 반환값: {ret}")
+    def _parse_line(self, line, lineno):
+        """단일 줄을 Instruction으로 파싱"""
+
+        # 시작
+        if line == K_START:
+            return Inst('start', line=lineno)
+
+        # 종료
+        if line.startswith(K_EXIT):
+            return Inst('exit', line=lineno, value=line[len(K_EXIT):].strip())
+
+        # 입력
+        if K_INPUT in line:
+            prefix = line[:line.index(K_INPUT)]
+            return Inst('input', line=lineno, var=prefix.count(K_K) + 1)
+
+        # 줄 점프
+        if line.startswith(K_JUMP):
+            return Inst('jump', line=lineno, target=line[len(K_JUMP):].strip())
+
+        # 루프 탈출
+        if line.startswith(K_LOOP_BREAK):
+            return Inst('loop_break', line=lineno,
+                        condition=line[len(K_LOOP_BREAK):].strip())
+
+        # 조건문
+        if line.startswith(K_COND) and '?' in line[len(K_COND):]:
+            rest = line[len(K_COND):]
+            q = rest.index('?')
+            return Inst('cond', line=lineno,
+                        condition=rest[:q].strip(),
+                        command=rest[q+1:].strip())
+
+        # 루프 시작
+        if line == K_LOOP_START:
+            return Inst('loop_start', line=lineno)
+
+        # 개행
+        if line.startswith(K_NEWLINE_KW) and K_NEWLINE_END in line and '~' in line:
+            inner = line[line.index(K_NEWLINE_KW)+1:line.rindex(K_NEWLINE_END)]
+            suffix = line[line.rindex(K_NEWLINE_END)+1:]
+            return Inst('newline', line=lineno,
+                        count=max(inner.count('~'), 1),
+                        suffix=suffix.strip())
+
+        # 출력 (kk이야)
+        if K_PRINT in line:
+            pos = line.index(K_PRINT)
+            prefix = line[:pos]
+            rest = line[pos+len(K_PRINT):]
+            if not prefix and not rest:
+                return Inst('print_int', line=lineno, var=1)
+            if not rest and prefix and all(c == K_K for c in prefix):
+                return Inst('print_int', line=lineno, var=prefix.count(K_K)+1)
+            # rest가 ㅋ로만 구성 → 정수 출력
+            if rest and all(c == K_K for c in rest):
+                return Inst('print_int', line=lineno, var=rest.count(K_K)+1)
+            return Inst('print_char', line=lineno, value=rest.strip())
+
+        # 함수 호출
+        if line.startswith(K_CALL):
+            return Inst('call', line=lineno, name=line[len(K_CALL):].strip())
+
+        # 대입 (엄)
+        if K_ASSIGN in line:
+            pos = line.index(K_ASSIGN)
+            var_part = line[:pos]
+            val_part = line[pos+1:]
+            var_idx = var_part.count(K_K) or 1
+            return Inst('assign', line=lineno, var=var_idx, value=val_part.strip())
+
+        raise SyntaxError(f"알 수 없는 명령어 (줄 {lineno}): {line}")
+
+    # ── 실행 ──
+
+    def run(self, source):
+        self.parse(source)
+        if self.debug:
+            self._dump_ast()
+        self.pc = 0
+        steps = 0
+        while self.pc < len(self.instructions):
+            inst = self.instructions[self.pc]
+            self.pc += 1
+            if self.debug and inst.kind not in ('nop',):
+                ln = inst.data.get('line', '?')
+                print(f"  [pc={self.pc-1}, 줄 {ln}] {inst.kind} | {dict(sorted(self.memory.items()))}")
+            self._exec(inst)
+            steps += 1
+            if steps > 100000:
+                raise RecursionError("무한 루프 감지! (100,000 단계 초과)")
+
+    def _exec(self, inst):
+        k = inst.kind
+
+        if k in ('nop', 'start'):
+            return
+
+        if k == 'exit':
+            ret = self._val(inst.data['value'], "내아내임")
+            if self.debug:
+                print(f"\n[한남랭] 종료. 반환값: {ret}")
             sys.exit(ret)
 
-        # 제가요? (입력) — ㅋ 접두사로 변수 지정
-        if '제가요?' in line:
-            prefix = line[:line.index('제가요?')]
-            kk_count = prefix.count('ㅋ')
-            var_index = kk_count + 1
-            # 엄 접두사 허용 (하위 호환)
-            if prefix.endswith('엄'):
-                kk_count = prefix[:-1].count('ㅋ')
-                var_index = kk_count + 1
+        if k == 'input':
             try:
-                val = int(input())
+                val = int(input("입력: "))
             except (ValueError, EOFError):
                 val = 0
-            self.set_var(var_index, val)
-            return None
+            self.memory[inst.data['var']] = val
 
-        # 요이 (줄 점프)
-        if line.startswith('요이'):
-            target = self.parse_number(line[len('요이'):])
-            return target - 1  # 0-indexed
+        elif k == 'jump':
+            self.pc = self._val(inst.data['target'], "요이") - 1
 
-        # 아뇨아뇨아뇨 (루프 탈출) — 세 번 붙여야 탈출
-        if line.startswith('아뇨아뇨아뇨'):
-            rest = line[len('아뇨아뇨아뇨'):]
-            loop_val = self.parse_number(rest)
-            if loop_val != 0:
-                return self.pointer + 1
-            else:
-                if self.loops:
-                    return self.loops[-1]
-                return None
-
-        # 아뇨 (조건문) — 아뇨{값}?{명령}
-        if line.startswith('아뇨') and '?' in line:
-            rest = line[len('아뇨'):]
-            cond_str, cmd = rest.split('?', 1)
-            cond = self.parse_number(cond_str)
+        elif k == 'loop_break':
+            cond = self._val(inst.data['condition'], "루프 탈출")
             if cond == 0:
-                return cmd
-            return None
+                return  # 탈출
+            if self.loop_stack:
+                self.pc = self.loop_stack[-1]  # 계속
 
-        # ㅋㅋ..엄 (루프 시작)
-        if line == 'ㅋㅋ..엄' or line == '예? 저요?':
-            self.loops.append(self.pointer)
-            return None
+        elif k == 'loop_start':
+            self.loop_stack.append(self.pc)
 
-        # 티~원 (개행) — 티~~~~원 = 물결 갯수만큼 개행
-        if line.startswith('티') and '원' in line and '~' in line:
-            inner = line[line.index('티') + 1:line.rindex('원')]
-            tilde_count = inner.count('~')
-            # 뒤에 값이 있으면 그 값 출력 후 개행
-            suffix = line[line.rindex('원') + 1:]
-            if suffix:
-                val = self.parse_number(suffix)
-                print(val, end='')
-            for _ in range(max(tilde_count, 1)):
-                print()
-            return None
+        elif k == 'cond':
+            if self._val(inst.data['condition'], "조건") == 0:
+                self._exec_str(inst.data['command'])
 
-        # 줴줴이야 (문자 출력)
-        if '줴줴이야' in line:
-            value_expr = line[line.index('줴줴이야') + 4:]
-            val = self.parse_number(value_expr)
+        elif k == 'newline':
+            if inst.data['suffix']:
+                print(self._val(inst.data['suffix'], "티~원"), end='')
+            print('\n' * (inst.data['count'] - 1), end='\n')
+
+        elif k == 'print_int':
+            print(self.memory.get(inst.data['var'], 0), end='')
+
+        elif k == 'print_char':
+            val = self._val(inst.data['value'], " kk이야")
             try:
                 print(chr(val), end='')
             except (ValueError, OverflowError):
                 print(val, end='')
-            return None
 
-        # 엄 (대입) — 엄 뒤에 마침표+반점 합산 최소 3개, 제가요? 입력은 예외
-        if '엄' in line:
-            var_part, val_part = line.split('엄', 1)
-            is_input = '제가요?' in val_part
-            punct_count = val_part.count('.') + val_part.count(',')
-            if not is_input and (not val_part or punct_count < 3):
-                raise SyntaxError(f"엄 뒤에 마침표/반점 3개 이상 필요: {line}")
-            kk_count = var_part.count('ㅋ')
-            var_index = kk_count if kk_count > 0 else 1
-            val = self.parse_number(val_part)
-            self.set_var(var_index, val)
-            return None
+        elif k == 'assign':
+            self.memory[inst.data['var']] = self._val(inst.data['value'], "대입")
 
-        # 알 수 없는 명령어 (무시)
-        return None
+        elif k == 'call':
+            name = inst.data['name']
+            if name not in self.functions:
+                raise SyntaxError(f"정의되지 않은 함수: '{name}' (줄 {inst.data['line']})")
+            saved_pc = self.pc
+            saved_loop = list(self.loop_stack)
+            for fi in self.functions[name]:
+                self._exec(fi)
+            self.pc = saved_pc
+            self.loop_stack = saved_loop
 
-    def run(self, code, check=True):
-        """
-        프로그램 실행.
-        code: 소스 코드 문자열
-        """
-        # 줄바꿈 또는 ~로 분리
-        if '~' in code and '\n' not in code:
-            self.lines = code.split('~')
-        else:
-            self.lines = code.split('\n')
+    def _exec_str(self, cmd):
+        """조건부 실행용 문자열 명령어 처리"""
+        cmd = cmd.strip()
+        if not cmd:
+            return
+        # kk이야 출력
+        if cmd == K_PRINT:
+            print(self.memory.get(1, 0), end='')
+            return
+        if cmd.startswith(K_PRINT):
+            rest = cmd[len(K_PRINT):]
+            if not rest:
+                print(self.memory.get(1, 0), end='')
+            else:
+                val = self._val(rest)
+                try:
+                    print(chr(val), end='')
+                except (ValueError, OverflowError):
+                    print(val, end='')
+            return
+        # 대입
+        if K_ASSIGN in cmd:
+            pos = cmd.index(K_ASSIGN)
+            var_part = cmd[:pos]
+            val_part = cmd[pos+1:]
+            var_idx = var_part.count(K_K) or 1
+            self.memory[var_idx] = self._val(val_part)
+            return
 
-        # 시작/종료 검사 (주석 건너뛰기)
-        if check:
-            code_lines = [l.strip() for l in self.lines if l.strip() and not l.strip().startswith('#')]
-            if not code_lines or code_lines[0] != '예? 저요?':
-                raise SyntaxError("한남랭은 '예? 저요?'로 시작해야 합니다!")
-            if not code_lines[-1].startswith('내아내임'):
-                raise SyntaxError("한남랭은 '내아내임'으로 종료해야 합니다!")
+    # ── 디버그 ──
 
-        self.running = True
-        self.pointer = 0
-        max_steps = 100000
-        steps = 0
+    def _dump_ast(self):
+        print("═══ AST ═══")
+        for i, inst in enumerate(self.instructions):
+            if inst.kind == 'nop':
+                continue
+            ln = inst.data.get('line', '?')
+            d = {k: v for k, v in inst.data.items() if k != 'line'}
+            print(f"  [{i:3d}] (줄 {ln:>3}) {inst.kind:12} {d}")
+        print("═══ 실행 ═══")
 
-        while self.running and self.pointer < len(self.lines):
-            line = self.lines[self.pointer]
-            self.pointer += 1
 
-            result = self.parse_line(line)
-
-            if result is not None:
-                if isinstance(result, int):
-                    # 점프
-                    self.pointer = result
-                elif isinstance(result, str):
-                    # 조건부 명령 실행
-                    self.parse_line(result)
-
-            steps += 1
-            if steps >= max_steps:
-                raise RecursionError("무한 루프가 감지되었습니다!")
-
+# ══════════════════════════════════════════════════════════════
+# 엔트리포인트
+# ══════════════════════════════════════════════════════════════
 
 def main():
-    if len(sys.argv) < 2:
-        print("사용법: python hannam.py <파일.한남>")
-        print("       python hannam.py -e '<코드>'")
+    args = sys.argv[1:]
+    debug = '--debug' in args
+    ast_only = '--ast' in args
+    repl = '--repl' in args
+    args = [a for a in args if not a.startswith('--')]
+
+    if repl:
+        print("한남랭 REPL (v3.0)")
+        print("종료: Ctrl+C 또는 'quit'")
+        buf = []
+        while True:
+            try:
+                line = input("한남> ").strip()
+                if line == 'quit':
+                    break
+                buf.append(line)
+                if line.startswith(K_EXIT):
+                    code = '\n'.join(buf)
+                    if not code.startswith(K_START):
+                        code = K_START + '\n' + code
+                    try:
+                        HannamLang(debug=debug).run(code)
+                    except SystemExit:
+                        pass
+                    except Exception as e:
+                        print(f"오류: {e}")
+                    buf = []
+            except (EOFError, KeyboardInterrupt):
+                print("\n종료합니다.")
+                break
+        return
+
+    if not args:
+        print("사용법: python hannam.py [옵션] <파일.한남>")
+        print()
+        print("옵션:")
+        print("  --debug   실행 과정 단계별 출력")
+        print("  --ast     파싱된 AST 출력 (실행 안 함)")
+        print("  --repl    대화형 REPL 모드")
         sys.exit(1)
 
-    if sys.argv[1] == '-e':
-        # 코드 직접 실행
-        code = sys.argv[2]
-    else:
-        # 파일 실행
-        try:
-            with open(sys.argv[1], encoding='utf-8') as f:
-                code = f.read()
-        except FileNotFoundError:
-            print(f"파일을 찾을 수 없습니다: {sys.argv[1]}")
-            sys.exit(1)
+    try:
+        with open(args[0], encoding='utf-8') as f:
+            code = f.read()
+    except FileNotFoundError:
+        print(f"파일을 찾을 수 없습니다: {args[0]}")
+        sys.exit(1)
 
-    interpreter = HannamLang()
-    interpreter.run(code)
+    interp = HannamLang(debug=debug)
+
+    if ast_only:
+        interp.parse(code)
+        print(f"═══ AST ({args[0]}) ═══")
+        interp._dump_ast()
+        return
+
+    interp.run(code)
 
 
 if __name__ == '__main__':
