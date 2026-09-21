@@ -37,6 +37,16 @@ K_GT = '\uC934~~\uB77C'           # 쥐~~랄 (>)
 K_LT = '\uC934~~~\uB77C'          # 쥐~~~랄 (<)
 K_NE = '\uC934\uD788\uB77C'      # 쥐히랄 (!=)
 
+# ── 테이프 (Brainfuck 스타일) ──
+K_TAPE_RIGHT = '\uB4DC\uAC00\uC7AC'          # 드가재 (>)
+K_TAPE_LEFT = '\uB108\uB098\uAC00\uB77C'     # 넌나가라 (<)
+K_TAPE_INC = '\uC5B4\uD788'                   # 어흐 (+)
+K_TAPE_DEC = '\uC544\uD788'                   # 아흐 (-)
+K_TAPE_OUT = '\uC608\uC5D0?'                  # 예에? (.)
+K_TAPE_IN = '\uC608?'                         # 예? (,)
+K_TAPE_LOOP_START = '\uC316'                  # 엌 ([)
+K_TAPE_LOOP_END = '\uC316\uCE5C'             # 엌ㅋ (])
+
 
 # ══════════════════════════════════════════════════════════════
 # 수식 파서 (연산자 우선순위: 비교 < 덧셈 < 곱셈 < 단항)
@@ -222,6 +232,9 @@ class HannamLang:
         self.loop_stack = []
         self.pc = 0
         self.parser = ExprParser(lambda idx: self.memory.get(idx, 0))
+        # 테이프 (Brainfuck 스타일)
+        self.tape = [0] * 30000
+        self.tape_ptr = 0
 
     def _val(self, expr, ctx=""):
         return self.parser.parse(expr)
@@ -264,6 +277,23 @@ class HannamLang:
             self.instructions.append(inst)
             i += 1
 
+            # 테이프 루프 시작 (ㅋ) → 본체 수집
+            if inst.kind == 'tape_loop_start':
+                body = []
+                depth = 1
+                while i < len(lines):
+                    bl = self._clean(lines[i])
+                    if bl == K_TAPE_LOOP_START:
+                        depth += 1
+                    elif bl == K_TAPE_LOOP_END:
+                        depth -= 1
+                        if depth == 0:
+                            self.instructions[-1] = Inst('tape_loop', line=lineno, body=body)
+                            i += 1
+                            break
+                    body.append(self._parse_line(bl, i))
+                    i += 1
+
         # 시작/종료 검증
         real = [i for i in self.instructions if i.kind != 'nop']
         if not real or real[0].kind != 'start':
@@ -289,7 +319,7 @@ class HannamLang:
                 i += 1
                 continue
 
-            # 루프 시작 → 본체 수집
+            # 루프 시작 (ㅋㅋ..ㅋㅋ)
             if line == K_LOOP_START:
                 body = []
                 i += 1
@@ -301,6 +331,25 @@ class HannamLang:
                                           body=body, condition=cond))
                         i += 1
                         break
+                    body.append(self._parse_line(bl, base_lineno + i))
+                    i += 1
+                continue
+
+            # 테이프 루프 시작 (ㅋ)
+            if line == K_TAPE_LOOP_START:
+                body = []
+                i += 1
+                depth = 1
+                while i < len(raw_lines):
+                    bl = self._clean(raw_lines[i])
+                    if bl == K_TAPE_LOOP_START:
+                        depth += 1
+                    elif bl == K_TAPE_LOOP_END:
+                        depth -= 1
+                        if depth == 0:
+                            insts.append(Inst('tape_loop', line=lineno, body=body))
+                            i += 1
+                            break
                     body.append(self._parse_line(bl, base_lineno + i))
                     i += 1
                 continue
@@ -379,6 +428,24 @@ class HannamLang:
             val_part = line[pos+1:]
             var_idx = var_part.count(K_K) or 1
             return Inst('assign', line=lineno, var=var_idx, value=val_part.strip())
+
+        # ── 테이프 명령어 ──
+        if line == K_TAPE_RIGHT:
+            return Inst('tape_right', line=lineno)
+        if line == K_TAPE_LEFT:
+            return Inst('tape_left', line=lineno)
+        if line == K_TAPE_INC:
+            return Inst('tape_inc', line=lineno)
+        if line == K_TAPE_DEC:
+            return Inst('tape_dec', line=lineno)
+        if line == K_TAPE_OUT:
+            return Inst('tape_out', line=lineno)
+        if line == K_TAPE_IN:
+            return Inst('tape_in', line=lineno)
+        if line == K_TAPE_LOOP_START:
+            return Inst('tape_loop_start', line=lineno)
+        if line == K_TAPE_LOOP_END:
+            return Inst('tape_loop_end', line=lineno)
 
         raise SyntaxError(f"알 수 없는 명령어 (줄 {lineno}): {line}")
 
@@ -479,6 +546,33 @@ class HannamLang:
                 self._exec(fi)
             self.pc = saved_pc
             self.loop_stack = saved_loop
+
+        # ── 테이프 명령어 ──
+        elif k == 'tape_right':
+            self.tape_ptr = (self.tape_ptr + 1) % 30000
+        elif k == 'tape_left':
+            self.tape_ptr = (self.tape_ptr - 1) % 30000
+        elif k == 'tape_inc':
+            self.tape[self.tape_ptr] = (self.tape[self.tape_ptr] + 1) % 256
+        elif k == 'tape_dec':
+            self.tape[self.tape_ptr] = (self.tape[self.tape_ptr] - 1) % 256
+        elif k == 'tape_out':
+            print(chr(self.tape[self.tape_ptr]), end='')
+        elif k == 'tape_in':
+            try:
+                self.tape[self.tape_ptr] = ord(input()[0]) % 256
+            except (IndexError, EOFError):
+                self.tape[self.tape_ptr] = 0
+        elif k == 'tape_loop':
+            body = inst.data['body']
+            max_iter = 1000000
+            for _ in range(max_iter):
+                if self.tape[self.tape_ptr] == 0:
+                    break
+                for bi in body:
+                    self._exec(bi)
+            else:
+                raise RecursionError("테이프 루프 무한 반복!")
 
     def _exec_str(self, cmd):
         """조건부 실행용 문자열 명령어 처리"""
