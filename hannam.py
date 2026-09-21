@@ -278,13 +278,35 @@ class HannamLang:
         return line
 
     def _parse_body(self, raw_lines, base_lineno):
-        """함수 본체를 Instruction 리스트로 파싱"""
+        """함수 본체를 Instruction 리스트로 파싱 (루프 지원)"""
         insts = []
-        for i, raw in enumerate(raw_lines):
-            line = self._clean(raw)
+        i = 0
+        while i < len(raw_lines):
+            line = self._clean(raw_lines[i])
+            lineno = base_lineno + i
+
             if not line:
+                i += 1
                 continue
-            insts.append(self._parse_line(line, base_lineno + i))
+
+            # 루프 시작 → 본체 수집
+            if line == K_LOOP_START:
+                body = []
+                i += 1
+                while i < len(raw_lines):
+                    bl = self._clean(raw_lines[i])
+                    if bl.startswith(K_LOOP_BREAK):
+                        cond = bl[len(K_LOOP_BREAK):].strip()
+                        insts.append(Inst('loop', line=lineno,
+                                          body=body, condition=cond))
+                        i += 1
+                        break
+                    body.append(self._parse_line(bl, base_lineno + i))
+                    i += 1
+                continue
+
+            insts.append(self._parse_line(line, lineno))
+            i += 1
         return insts
 
     def _parse_line(self, line, lineno):
@@ -400,6 +422,20 @@ class HannamLang:
 
         elif k == 'jump':
             self.pc = self._val(inst.data['target'], "요이") - 1
+
+        elif k == 'loop':
+            # 자가 포함 루프 (함수 본체용)
+            body = inst.data['body']
+            condition = inst.data['condition']
+            max_iter = 100000
+            for _ in range(max_iter):
+                for bi in body:
+                    self._exec(bi)
+                cond = self._val(condition, "루프 조건")
+                if cond == 0:
+                    break
+            else:
+                raise RecursionError("무한 루프 감지! (100,000 반복 초과)")
 
         elif k == 'loop_break':
             cond = self._val(inst.data['condition'], "루프 탈출")
