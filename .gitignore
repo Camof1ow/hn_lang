@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+/hn_lang.iml
+/.idea/
